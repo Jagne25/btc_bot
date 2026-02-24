@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Logs & outputs
+logs/
+*.log
+*.csv
+*.parquet
+*.feather
+
+# Backtests / exports / data
+backtests/
+exports/
+reports/
+tmp/
+data/
+raw_data/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Runtime state
+portfolio_state.json
+trade_state.json
+*.sqlite
