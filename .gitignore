@@ -11,6 +11,7 @@ env/
 logs/
 *.log
 *.csv
+!signals_BTC_vps.csv
 *.parquet
 *.feather
 
