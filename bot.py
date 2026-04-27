@@ -105,6 +105,61 @@ def perf(eq: pd.Series):
     dd = (eq/eq.cummax()-1).min()*100
     return float(total), float(dd)
 
+def compute_pullback_signal(df):
+    """
+    Skontroluje pullback podmienky na poslednej sviečke.
+    Vracia: side (1=LONG, 0=FLAT), info dict pre logging.
+    """
+    d = df.copy()
+    d["ma20"]  = d["close"].rolling(20).mean()
+    d["ma200"] = d["close"].rolling(200).mean()
+    d["ma200_slope"] = (d["ma200"] - d["ma200"].shift(5)) / d["ma200"] * 100
+    d["dist_ma20"] = (d["close"] - d["ma20"]) / d["ma20"] * 100
+
+    hl = d["high"] - d["low"]
+    hc = (d["high"] - d["close"].shift(1)).abs()
+    lc = (d["low"]  - d["close"].shift(1)).abs()
+    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    d["atr_bt"]     = tr.rolling(14).mean()
+    d["atr_pct_bt"] = d["atr_bt"] / d["close"] * 100
+
+    high_diff = d["high"].diff()
+    low_diff  = -d["low"].diff()
+    plus_dm   = high_diff.where((high_diff > low_diff) & (high_diff > 0), 0.0)
+    minus_dm  = low_diff.where((low_diff > high_diff) & (low_diff > 0), 0.0)
+    atr_adx   = tr.ewm(span=14, adjust=False).mean()
+    plus_di   = 100 * plus_dm.ewm(span=14, adjust=False).mean() / atr_adx
+    minus_di  = 100 * minus_dm.ewm(span=14, adjust=False).mean() / atr_adx
+    dx        = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    d["adx14_bt"] = dx.ewm(span=14, adjust=False).mean()
+
+    row  = d.iloc[-1]
+    prev = d.iloc[-2]
+
+    trend_up      = bool(row["close"] > row["ma200"])
+    ma200_rising  = bool(row["ma200_slope"] > 0)
+    adx_ok        = bool(row["adx14_bt"] > 25)
+    dist          = float(row["dist_ma20"])
+    pullback_ok   = bool((dist < -1.0) and (dist > -8.0))
+    volatility_ok = bool(row["atr_pct_bt"] < 5.0)
+    breakout      = bool(row["close"] > prev["high"])
+
+    all_ok = trend_up and ma200_rising and adx_ok and pullback_ok and volatility_ok and breakout
+
+    info = {
+        "trend_up":      trend_up,
+        "ma200_rising":  ma200_rising,
+        "adx14":         round(float(row["adx14_bt"]), 1),
+        "adx_ok":        adx_ok,
+        "dist_ma20":     round(dist, 2),
+        "pullback_ok":   pullback_ok,
+        "volatility_ok": volatility_ok,
+        "breakout":      breakout,
+        "SIGNAL":        "LONG" if all_ok else "FLAT",
+    }
+    return 1 if all_ok else 0, info
+
+
 def main():
     load_dotenv()
 
@@ -135,8 +190,13 @@ def main():
     EQUITY_USDT = float(os.getenv("EQUITY_USDT", "1000"))
     RISK_PCT    = float(os.getenv("RISK_PCT", "0.01"))
 
-    LOG_CSV = os.getenv("LOG_CSV", f"logs/signals_{SYMBOL.replace('USDT','')}.csv")
-    os.makedirs("logs", exist_ok=True)
+    DATA_DIR = os.getenv("DATA_DIR")
+    if not DATA_DIR or not os.path.exists(DATA_DIR):
+        raise RuntimeError(f"DATA_DIR chýba alebo SSD nie je pripojené: {DATA_DIR}")
+    os.makedirs(os.path.join(DATA_DIR, "logs"), exist_ok=True)
+    os.makedirs(os.path.join(DATA_DIR, "state"), exist_ok=True)
+
+    LOG_CSV = os.getenv("LOG_CSV", os.path.join(DATA_DIR, "logs", f"signals_{SYMBOL.replace('USDT','')}.csv"))
 
     now_utc = dt.datetime.now(dt.timezone.utc)
     print(f"[{now_utc:%Y-%m-%d %H:%M} UTC] Fetch {SYMBOL} {INTERVAL}...")
@@ -160,95 +220,105 @@ def main():
     d = d.dropna(subset=need_cols).reset_index(drop=True)
     
     d_live = d.copy()
-    
-    horizon = TIME_STOP_BARS
-    split = int(len(d) * 0.7)
-    
-    if split - horizon < 50:
-        raise RuntimeError(
-            f"Príliš málo dát: train={split - horizon} barov (min 50). "
-            f"Zníž TIME_STOP_BARS alebo zväčš LOOKBACK."
-        )
-    
-    train = d.iloc[:split - horizon].copy()
-    test = d.iloc[split:].copy()
-    
-    print(f"Buffer split: train={len(train)} | buffer={horizon} | test={len(test)}")
-    
-    train["label_ft"] = make_first_touch_label(train, atr_mult_sl=ATR_MULT_SL, horizon=TIME_STOP_BARS)
-    test["label_ft"] = make_first_touch_label(test, atr_mult_sl=ATR_MULT_SL, horizon=TIME_STOP_BARS)
-    
-    train = train.dropna(subset=["label_ft"]).reset_index(drop=True)
-    test = test.dropna(subset=["label_ft"]).reset_index(drop=True)
-    
-    Xtr, ytr = train[feats], train["label_ft"].astype(int)
-    Xte, yte = test[feats], test["label_ft"].astype(int)
-
-    if MODEL == "RF":
-        model = RandomForestClassifier(n_estimators=500, max_depth=5, min_samples_leaf=10,
-                                       random_state=42, n_jobs=-1)
-        pipe = Pipeline([("rf", model)]).fit(Xtr, ytr)
-    else:
-        model = LogisticRegression(max_iter=1000, random_state=42)
-        pipe = Pipeline([("scaler", StandardScaler()), ("lr", model)]).fit(Xtr, ytr)
-
-    test = test.copy()
-    test["proba_up"] = pipe.predict_proba(Xte)[:,1]
-
-    p = np.zeros(len(test), dtype=int)
-    long_mask  = test["proba_up"] > TH_LONG
-    short_mask = (test["proba_up"] < TH_SHORT) if ALLOW_SHORTS else np.zeros(len(test), dtype=bool)
-
-    if USE_TREND_FILTER and "sma_trend" in test.columns:
-        sma = test["sma_trend"]
-        long_mask  = long_mask  & (test["close"] > sma)
-        short_mask = short_mask & (test["close"] < sma)
-
-    p[long_mask.values]  =  1
-    p[np.array(short_mask, dtype=bool)] = -1
-
-    pos_both = pd.Series(p, index=test.index)
-    ret = test["close"].pct_change()
-    
-    # FEE OPRAVA: správne počítanie fee pri flipoch (1->-1 = 2 fees)
-    turnover = pos_both.diff().abs()
-    fee_events = (turnover > 0).astype(int) + (turnover > 1).astype(int)
-    r_plain = pos_both.shift(1).fillna(0) * ret - FEE * fee_events
-    
-    eq_plain = (1 + r_plain.fillna(0)).cumprod()
-
-    tot_ml, dd_ml = perf(eq_plain)
-    trades = int(((pos_both.shift(1).fillna(0) == 0) & (pos_both != 0)).sum())
 
     last_row = d_live.iloc[-1]
     close = float(last_row["close"])
-    proba_live = float(pipe.predict_proba(d_live[feats].iloc[[-1]])[:,1][0])
 
     if "close_time" in last_row and pd.notna(last_row["close_time"]):
         bar_time = pd.to_datetime(last_row["close_time"])
     else:
         bar_time = pd.to_datetime(df["close_time"].iloc[-1])
-    
     if bar_time.tzinfo is None:
         bar_time = bar_time.replace(tzinfo=dt.timezone.utc)
     else:
         bar_time = bar_time.astimezone(dt.timezone.utc)
 
-    trend_ok_long = True
-    trend_ok_short = True
-    if USE_TREND_FILTER:
-        sma_val = float(last_row.get("sma_trend", np.nan))
-        if not np.isfinite(sma_val):
-            trend_ok_long = trend_ok_short = False
-        else:
-            trend_ok_long  = close > sma_val
-            trend_ok_short = close < sma_val
+    if MODEL == "PULLBACK":
+        side, pb_info = compute_pullback_signal(df)
+        proba_live = float(side)
+        tot_ml = dd_ml = 0.0
+        trades = 0
+        print("PULLBACK PODMIENKY:")
+        for k, v in pb_info.items():
+            marker = " ✓" if v is True else (" ✗" if v is False else "")
+            print(f"  {k}: {v}{marker}")
 
-    side = 0
-    if proba_live >= TH_LONG and trend_ok_long:
-        side = 1
-    elif ALLOW_SHORTS and proba_live <= TH_SHORT and trend_ok_short:
-        side = -1
+    else:
+        horizon = TIME_STOP_BARS
+        split = int(len(d) * 0.7)
+
+        if split - horizon < 50:
+            raise RuntimeError(
+                f"Príliš málo dát: train={split - horizon} barov (min 50). "
+                f"Zníž TIME_STOP_BARS alebo zväčši LOOKBACK."
+            )
+
+        train = d.iloc[:split - horizon].copy()
+        test = d.iloc[split:].copy()
+
+        print(f"Buffer split: train={len(train)} | buffer={horizon} | test={len(test)}")
+
+        train["label_ft"] = make_first_touch_label(train, atr_mult_sl=ATR_MULT_SL, horizon=TIME_STOP_BARS)
+        test["label_ft"] = make_first_touch_label(test, atr_mult_sl=ATR_MULT_SL, horizon=TIME_STOP_BARS)
+
+        train = train.dropna(subset=["label_ft"]).reset_index(drop=True)
+        test = test.dropna(subset=["label_ft"]).reset_index(drop=True)
+
+        Xtr, ytr = train[feats], train["label_ft"].astype(int)
+        Xte, yte = test[feats], test["label_ft"].astype(int)
+
+        if MODEL == "RF":
+            model = RandomForestClassifier(n_estimators=500, max_depth=5, min_samples_leaf=10,
+                                           random_state=42, n_jobs=-1)
+            pipe = Pipeline([("rf", model)]).fit(Xtr, ytr)
+        else:
+            model = LogisticRegression(max_iter=1000, random_state=42)
+            pipe = Pipeline([("scaler", StandardScaler()), ("lr", model)]).fit(Xtr, ytr)
+
+        test = test.copy()
+        test["proba_up"] = pipe.predict_proba(Xte)[:,1]
+
+        p = np.zeros(len(test), dtype=int)
+        long_mask  = test["proba_up"] > TH_LONG
+        short_mask = (test["proba_up"] < TH_SHORT) if ALLOW_SHORTS else np.zeros(len(test), dtype=bool)
+
+        if USE_TREND_FILTER and "sma_trend" in test.columns:
+            sma = test["sma_trend"]
+            long_mask  = long_mask  & (test["close"] > sma)
+            short_mask = short_mask & (test["close"] < sma)
+
+        p[long_mask.values]  =  1
+        p[np.array(short_mask, dtype=bool)] = -1
+
+        pos_both = pd.Series(p, index=test.index)
+        ret = test["close"].pct_change()
+
+        turnover = pos_both.diff().abs()
+        fee_events = (turnover > 0).astype(int) + (turnover > 1).astype(int)
+        r_plain = pos_both.shift(1).fillna(0) * ret - FEE * fee_events
+
+        eq_plain = (1 + r_plain.fillna(0)).cumprod()
+
+        tot_ml, dd_ml = perf(eq_plain)
+        trades = int(((pos_both.shift(1).fillna(0) == 0) & (pos_both != 0)).sum())
+
+        proba_live = float(pipe.predict_proba(d_live[feats].iloc[[-1]])[:,1][0])
+
+        trend_ok_long = True
+        trend_ok_short = True
+        if USE_TREND_FILTER:
+            sma_val = float(last_row.get("sma_trend", np.nan))
+            if not np.isfinite(sma_val):
+                trend_ok_long = trend_ok_short = False
+            else:
+                trend_ok_long  = close > sma_val
+                trend_ok_short = close < sma_val
+
+        side = 0
+        if proba_live >= TH_LONG and trend_ok_long:
+            side = 1
+        elif ALLOW_SHORTS and proba_live <= TH_SHORT and trend_ok_short:
+            side = -1
 
     atr_series = compute_atr(df, period=ATR_PERIOD) if USE_ATR else None
     atr_prev = atr_series.shift(1) if atr_series is not None else None
@@ -279,8 +349,9 @@ def main():
         risk_usdt = EQUITY_USDT * RISK_PCT
         qty_suggest = (risk_usdt / R) if (R and R > 0) else None
 
-    print(f"MODEL={MODEL} | thL={TH_LONG:.2f} thS={TH_SHORT:.2f} | ALLOW_SHORTS={ALLOW_SHORTS} | TrendFilter={USE_TREND_FILTER}")
-    print(f"Test sanity check (plain, correct fees): total={tot_ml:.2f}% | MaxDD={dd_ml:.2f}% | entries={trades}")
+    print(f"MODEL={MODEL} | ALLOW_SHORTS={ALLOW_SHORTS}")
+    if MODEL != "PULLBACK":
+        print(f"Test sanity check: total={tot_ml:.2f}% | MaxDD={dd_ml:.2f}% | entries={trades}")
 
     tp_info = (f"TP@{TP_R:.1f}R={fmt(final_tp)}" if TP_R is not None else "TP=None")
 
