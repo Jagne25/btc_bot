@@ -3,140 +3,125 @@ import pandas as pd
 import plotly.graph_objects as go
 import numpy as np
 
-st.set_page_config(page_title="BTC Bot Dashboard", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Crypto Trading Bot", page_icon="📈", layout="wide")
 
-st.title("📈 BTC Trading Bot — Live Dashboard")
-st.caption("An ML-powered trading bot that analyzes BTC/USDT every 4 hours and automatically decides when to enter or exit the market — no manual intervention needed.")
+st.title("📈 Crypto Pullback Trading Bot")
+st.caption("Rule-based trend-following system. Monitors BTC, ETH, SOL, BNB every 4 hours automatically.")
 
-# --- load CSV ---
-CSV_PATH = "signals_BTC_vps.csv"
+# ── LOAD DATA ────────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=300)
-def load_data(path):
-    df = pd.read_csv(path, on_bad_lines="skip")
-    df["utc_time"] = pd.to_datetime(df["utc_time"])
-    df = df.drop_duplicates(subset=["bar_time"]).sort_values("utc_time").reset_index(drop=True)
-    return df
+def load_csv(path):
+    try:
+        df = pd.read_csv(path, on_bad_lines="skip")
+        df["utc_time"] = pd.to_datetime(df["utc_time"])
+        df = df.drop_duplicates(subset=["bar_time"]).sort_values("utc_time").reset_index(drop=True)
+        return df
+    except:
+        return None
 
-try:
-    df = load_data(CSV_PATH)
-except Exception as e:
-    st.error(f"Failed to load data: {e}")
-    st.stop()
+btc = load_csv("signals_BTC_vps.csv")
+eth = load_csv("signals_ETH_vps.csv")
 
-# --- metrics ---
-last = df.iloc[-1]
-long_signals = (df["signal"] == 1).sum()
-flat_signals  = (df["signal"] == 0).sum()
-last_total    = last["test_total_pct"]
-last_maxdd    = last["test_maxdd_pct"]
-last_trades   = last["trades_test"]
-flat_streak   = int((df["signal"] == 0).iloc[::-1].cumprod().sum())
+# ── BACKTEST RESULTS (hardcoded z backttestu) ─────────────────────────────────
 
-col1, col2, col3, col4, col5 = st.columns(5)
-col1.metric("Latest Signal", "LONG 🟢" if last["signal"] == 1 else "FLAT ⚪")
-col2.metric("ML Probability", f"{last['proba_up']:.3f}")
-col3.metric("BTC Price", f"${last['close']:,.0f}")
-col4.metric("Backtest Return", f"{last_total:.1f}%")
-col5.metric("Backtest Max DD", f"{last_maxdd:.1f}%")
+backtest = pd.DataFrame([
+    {"Coin": "BTC", "EV/trade": "+1.49%", "Return": "+58.1%", "Max DD": "-22.5%", "Trades": 40, "Winrate": "45%"},
+    {"Coin": "ETH", "EV/trade": "+0.83%", "Return": "+39.1%", "Max DD": "-32.1%", "Trades": 47, "Winrate": "45%"},
+    {"Coin": "SOL", "EV/trade": "+2.91%", "Return": "+136.6%", "Max DD": "-48.4%", "Trades": 47, "Winrate": "38%"},
+    {"Coin": "BNB", "EV/trade": "-0.25%", "Return": "-12.6%",  "Max DD": "-39.8%", "Trades": 50, "Winrate": "36%"},
+])
 
-st.divider()
+# ── CURRENT STATUS ────────────────────────────────────────────────────────────
 
-# --- equity curve ---
-st.subheader("📊 Simulated Equity Curve (Backtest)")
-st.caption("How $1,000 would have grown if the bot traded on historical data.")
+st.subheader("Current Signal Status")
 
-equity = [1000.0]
-for _, row in df.iterrows():
-    prev = equity[-1]
-    if row["signal"] == 1:
-        ret = (row["close"] - df.loc[max(0, _ - 1), "close"]) / df.loc[max(0, _ - 1), "close"]
-        equity.append(prev * (1 + ret * 0.5))
-    else:
-        equity.append(prev)
+cols = st.columns(4)
+coins_data = [
+    ("BTC", btc, "🟡"),
+    ("ETH", eth, "🔵"),
+    ("SOL", None, "🟣"),
+    ("BNB", None, "🟠"),
+]
 
-fig_eq = go.Figure()
-fig_eq.add_trace(go.Scatter(
-    x=df["utc_time"], y=equity[1:],
-    mode="lines", name="Equity",
-    line=dict(color="#06d6a0", width=2),
-    fill="tozeroy", fillcolor="rgba(6,214,160,0.1)"
-))
-fig_eq.add_hline(y=1000, line_dash="dash", line_color="#888", annotation_text="Start $1,000")
-fig_eq.update_layout(
-    template="plotly_dark", height=280,
-    margin=dict(l=0, r=0, t=10, b=0),
-    yaxis_tickprefix="$"
-)
-st.plotly_chart(fig_eq, use_container_width=True)
+for col, (coin, df_coin, emoji) in zip(cols, coins_data):
+    with col:
+        if df_coin is not None and len(df_coin) > 0:
+            last = df_coin.iloc[-1]
+            signal = int(last.get("side", 0))
+            close  = float(last.get("close", 0))
+            updated = str(last.get("utc_time", ""))[:16]
+            if signal == 1:
+                st.success(f"{emoji} **{coin}**\n\n🟢 LONG\n\n${close:,.2f}\n\n_{updated}_")
+            else:
+                st.info(f"{emoji} **{coin}**\n\n⚪ FLAT\n\n${close:,.2f}\n\n_{updated}_")
+        else:
+            st.info(f"{emoji} **{coin}**\n\n⚪ No data")
 
 st.divider()
 
-# --- BTC price + signals ---
-col_left, col_right = st.columns([2, 1])
+# ── STRATEGY + BACKTEST ───────────────────────────────────────────────────────
+
+col_left, col_right = st.columns([1, 2])
 
 with col_left:
+    st.subheader("Strategy Rules")
+    st.markdown("""
+    **Entry conditions (all must be true):**
+    - ✅ Price above MA200 (uptrend)
+    - ✅ ADX > 25 (strong trend)
+    - ✅ Price 1–8% below MA20 (pullback)
+    - ✅ Close above previous high (breakout)
+
+    **Exit:**
+    - Trailing stop at 3× ATR
+    - Updates every 4 hours automatically
+    """)
+
+with col_right:
+    st.subheader("Backtest Results (4h, 5 years)")
+    st.dataframe(backtest, use_container_width=True, hide_index=True)
+    st.caption("EV = average return per trade. Tested on 2021–2026 data.")
+
+st.divider()
+
+# ── BTC PRICE CHART ───────────────────────────────────────────────────────────
+
+if btc is not None and len(btc) > 0:
     st.subheader("BTC Price + LONG Signals")
+
+    longs = btc[btc["side"] == 1]
+
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=df["utc_time"], y=df["close"],
-        mode="lines", name="BTC close",
+        x=btc["utc_time"], y=btc["close"],
+        mode="lines", name="BTC Price",
         line=dict(color="#4895ef", width=1.5)
     ))
-    longs = df[df["signal"] == 1]
-    fig.add_trace(go.Scatter(
-        x=longs["utc_time"], y=longs["close"],
-        mode="markers", name="LONG signal",
-        marker=dict(color="#06d6a0", size=8, symbol="triangle-up")
-    ))
+    if len(longs) > 0:
+        fig.add_trace(go.Scatter(
+            x=longs["utc_time"], y=longs["close"],
+            mode="markers", name="LONG Entry",
+            marker=dict(color="#06d6a0", size=10, symbol="triangle-up")
+        ))
     fig.update_layout(
-        template="plotly_dark", height=320,
+        template="plotly_dark", height=350,
         margin=dict(l=0, r=0, t=10, b=0),
-        legend=dict(orientation="h", y=1.1)
+        legend=dict(orientation="h", y=1.05)
     )
     st.plotly_chart(fig, use_container_width=True)
 
-with col_right:
-    st.subheader("Statistics")
-    st.markdown(f"""
-    | Metric | Value |
-    |---|---|
-    | Total signals | {len(df)} |
-    | LONG signals | {long_signals} |
-    | FLAT signals | {flat_signals} |
-    | Trades (backtest) | {int(last_trades)} |
-    | Flat streak | {flat_streak} |
-    | Model | {last['model']} |
-    | Interval | {last['interval']} |
-    | Threshold | {last['threshold_long']} |
-    """)
-
 st.divider()
 
-# --- ML probability ---
-st.subheader("ML Probability Over Time")
-st.caption("When probability crosses the threshold (0.50), the bot enters a LONG position.")
-fig2 = go.Figure()
-fig2.add_trace(go.Scatter(
-    x=df["utc_time"], y=df["proba_up"],
-    mode="lines", name="LONG probability",
-    line=dict(color="#c77dff", width=1.5)
-))
-fig2.add_hline(y=float(last["threshold_long"]), line_dash="dash",
-               line_color="#ffd166", annotation_text="Entry threshold")
-fig2.update_layout(
-    template="plotly_dark", height=250,
-    margin=dict(l=0, r=0, t=10, b=0),
-    yaxis=dict(range=[0.3, 0.7])
-)
-st.plotly_chart(fig2, use_container_width=True)
+# ── RECENT SIGNALS TABLE ──────────────────────────────────────────────────────
+
+st.subheader("Recent Signals (BTC)")
+if btc is not None and len(btc) > 0:
+    show_cols = ["utc_time", "close", "side", "sl_price", "trail_sl", "atr"]
+    available = [c for c in show_cols if c in btc.columns]
+    recent = btc[available].tail(15).sort_values("utc_time", ascending=False).reset_index(drop=True)
+    recent["side"] = recent["side"].map({1: "🟢 LONG", 0: "⚪ FLAT"})
+    st.dataframe(recent, use_container_width=True)
 
 st.divider()
-
-# --- last signals table ---
-st.subheader("Last 20 Signals")
-cols_show = ["utc_time", "close", "proba_up", "signal", "sl_price", "partial_tp", "final_tp"]
-st.dataframe(
-    df[cols_show].tail(20).sort_values("utc_time", ascending=False).reset_index(drop=True),
-    use_container_width=True
-)
+st.caption("Bot runs on Hetzner VPS (Helsinki) · Binance Futures · Python + pandas + PyTorch")
