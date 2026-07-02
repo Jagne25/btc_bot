@@ -24,16 +24,23 @@ from binance.um_futures import UMFutures
 # načítaj .env podľa ENV_FILE (ak nie je, použije .env)
 load_dotenv(dotenv_path=os.getenv("ENV_FILE", ".env"), override=False)
 
+# --- DATA_DIR check ---
+_DATA_DIR = os.getenv("DATA_DIR")
+if not _DATA_DIR or not os.path.exists(_DATA_DIR):
+    raise RuntimeError(f"DATA_DIR chýba alebo SSD nie je pripojené: {_DATA_DIR}")
+os.makedirs(os.path.join(_DATA_DIR, "logs"), exist_ok=True)
+os.makedirs(os.path.join(_DATA_DIR, "state"), exist_ok=True)
+
 # --- cesty / konštanty ---
-CSV_PATH   = os.getenv("LOG_CSV", "logs/signals.csv")
-STATE_DIR  = os.getenv("STATE_DIR", "logs")
+CSV_PATH   = os.getenv("LOG_CSV",          os.path.join(_DATA_DIR, "logs",  "signals.csv"))
+STATE_DIR  = os.getenv("STATE_DIR",        os.path.join(_DATA_DIR, "state"))
 STATE_PATH = None  # nastaví sa v main() podľa symbolu
 
-PORTFOLIO_STATE = os.getenv("PORTFOLIO_STATE", "logs/portfolio_state.json")
+PORTFOLIO_STATE = os.getenv("PORTFOLIO_STATE", os.path.join(_DATA_DIR, "state", "portfolio_state.json"))
 PORTFOLIO_LOCK  = PORTFOLIO_STATE + ".lock"
 
 # --- SOCIAL snapshot/config ---
-SOCIAL_EDGE_SNAPSHOT = os.getenv("SOCIAL_EDGE_SNAPSHOT", "logs/social_edge_snapshot.csv")
+SOCIAL_EDGE_SNAPSHOT = os.getenv("SOCIAL_EDGE_SNAPSHOT", os.path.join(_DATA_DIR, "logs", "social_edge_snapshot.csv"))
 MODEL_NAME = os.getenv("MODEL", "LR").upper()
 
 # --- burzové kroky ---
@@ -548,12 +555,198 @@ def main():
                UPDATE_PROTECTION, UPDATE_DRIFT_PCT, SOFT_EXIT, st,
                free_risk_usdt, need_risk_usdt, r_dist, EQUITY_USDT, PORTFOLIO_MAX_RISK_AT_ONCE)
 
-    # --- zvyšok pôvodnej logiky (orders/hedge/soft-exit) nechávam tak ako si poslal ---
-    # Pozn.: sem už nič nemením, lebo tvoj NO_MATCH je vyriešený hore v read_edge_snapshot.
+    # ---- ORDER EXECUTION ----
 
-    # !!! ZACHOVAJ svoj pôvodný zvyšok kódu odtiaľto !!!
-    # (Keď chceš, môžem ti to ešte raz poslať komplet aj s tou časťou,
-    #  ale funkčne sa fix týka len env + read_edge_snapshot.)
+    def place_order(**kwargs):
+        """Pošle príkaz na Binance, alebo simuluje ak DRY_RUN=true."""
+        # odstráň None hodnoty
+        kwargs = {k: v for k, v in kwargs.items() if v is not None}
+        if DRY_RUN:
+            print(f"  [DRY] new_order: {kwargs}")
+            return {"orderId": "DRY"}
+        try:
+            return client.new_order(**kwargs)
+        except Exception as e:
+            print(f"  [ERR] new_order failed: {e} | params={kwargs}")
+            return None
+
+    def cancel_all():
+        if DRY_RUN:
+            print(f"  [DRY] cancel_open_orders {symbol}")
+            return
+        try:
+            client.cancel_open_orders(symbol=symbol)
+        except Exception as e:
+            print(f"  [WARN] cancel_open_orders: {e}")
+
+    pos_side_str = "BOTH"
+    if HEDGE_MODE:
+        pos_side_str = "LONG" if s.get("side", 0) > 0 else "SHORT"
+
+    entry_side = "BUY"  if s.get("side", 0) > 0 else "SELL"
+    close_side = "SELL" if s.get("side", 0) > 0 else "BUY"
+
+    current_qty = round_step(abs(pos_qty))
+    target_abs  = round_step(abs(target_qty))
+
+    # --- SOFT EXIT ---
+    do_soft_exit = False
+    if SOFT_EXIT != "OFF" and st.get("in_trade") and current_qty >= MIN_QTY:
+        if st.get("bars_in_trade", 0) >= SOFT_EXIT_MIN_BARS:
+            if st.get("flat_streak", 0) >= SOFT_EXIT_N:
+                do_soft_exit = True
+
+    if do_soft_exit:
+        print(f"SOFT EXIT: bars={st.get('bars_in_trade')} flat_streak={st.get('flat_streak')} → market close")
+        cancel_all()
+        close_ps = "LONG" if (HEDGE_MODE and pos_qty > 0) else ("SHORT" if HEDGE_MODE else "BOTH")
+        place_order(
+            symbol=symbol,
+            side="SELL" if pos_qty > 0 else "BUY",
+            type="MARKET",
+            quantity=fmt(current_qty, 6),
+            positionSide=close_ps,
+            reduceOnly="true" if not HEDGE_MODE else None,
+        )
+        st["in_trade"] = False
+        st["bars_in_trade"] = 0
+        st["flat_streak"] = 0
+        save_state(st)
+        return
+
+    # --- FLAT (side=0): zatvoriť ak je otvorená pozícia ---
+    if s.get("side", 0) == 0:
+        if current_qty >= MIN_QTY:
+            print("Signal=FLAT → closing position.")
+            cancel_all()
+            close_ps = "LONG" if (HEDGE_MODE and pos_qty > 0) else ("SHORT" if HEDGE_MODE else "BOTH")
+            place_order(
+                symbol=symbol,
+                side="SELL" if pos_qty > 0 else "BUY",
+                type="MARKET",
+                quantity=fmt(current_qty, 6),
+                positionSide=close_ps,
+                reduceOnly="true" if not HEDGE_MODE else None,
+            )
+            st["in_trade"] = False
+            st["bars_in_trade"] = 0
+        else:
+            print("Signal=FLAT, no open position. Nothing to do.")
+        save_state(st)
+        return
+
+    # --- UPDATE_PROTECTION ---
+    already_in = current_qty >= MIN_QTY and st.get("in_trade")
+    do_update  = True
+
+    if UPDATE_PROTECTION == "LOCK_ON_ENTRY":
+        if already_in:
+            do_update = False
+            print("UPDATE_PROTECTION=LOCK_ON_ENTRY: already in trade, skipping update.")
+    elif UPDATE_PROTECTION == "REFRESH_WITH_DRIFT":
+        if already_in:
+            last_entry = st.get("entry_price")
+            cur_close  = s.get("close")
+            if last_entry and cur_close:
+                drift = abs(cur_close - last_entry) / last_entry
+                if drift < UPDATE_DRIFT_PCT:
+                    do_update = False
+                    print(f"UPDATE_PROTECTION=REFRESH_WITH_DRIFT: drift={drift*100:.2f}% < {UPDATE_DRIFT_PCT*100:.2f}%, skipping.")
+
+    if not do_update:
+        save_state(st)
+        return
+
+    # --- Portfolio risk cap ---
+    if need_risk_usdt is not None and free_risk_usdt is not None:
+        if need_risk_usdt > free_risk_usdt + 0.01:
+            print(f"PORTFOLIO RISK CAP: need={fmt(need_risk_usdt)} USDT > free={fmt(free_risk_usdt)} USDT. Skip entry.")
+            save_state(st)
+            return
+
+    # --- Cancel starých orderov ---
+    cancel_all()
+
+    # --- Entry order (delta qty) ---
+    delta_qty = round_step(target_abs - current_qty)
+    if delta_qty >= MIN_QTY:
+        print(f"Entry: {entry_side} {delta_qty} {symbol} MARKET")
+        r = place_order(
+            symbol=symbol,
+            side=entry_side,
+            type="MARKET",
+            quantity=fmt(delta_qty, 6),
+            positionSide=pos_side_str,
+        )
+        if r:
+            st["entry_price"] = s.get("close")
+            st["in_trade"] = True
+            st["bars_in_trade"] = 0
+    elif current_qty < MIN_QTY:
+        print("Target qty < MIN_QTY a žiadna pozícia. Nothing to do.")
+        save_state(st)
+        return
+    else:
+        print(f"Already at target qty={current_qty}, no new entry needed.")
+
+    final_qty   = round_step(target_abs)
+    partial_qty = round_step(final_qty * (s.get("partial_pct") or 0.5))
+    remain_qty  = round_step(final_qty - partial_qty)
+
+    # --- SL order (MARK price) ---
+    if s.get("sl_price") is not None:
+        sl_px = round_price_for_sl(s["sl_price"], s["side"], PRICE_TICK)
+        print(f"SL:         {close_side} STOP_MARKET       @ {sl_px} (MARK)")
+        sl_params = dict(
+            symbol=symbol,
+            side=close_side,
+            type="STOP_MARKET",
+            stopPrice=fmt(sl_px, 1),
+            positionSide=pos_side_str,
+            workingType="MARK_PRICE",
+            timeInForce="GTE_GTC",
+        )
+        if HEDGE_MODE:
+            sl_params["quantity"] = fmt(final_qty, 6)
+        else:
+            sl_params["closePosition"] = "true"
+        place_order(**sl_params)
+
+    # --- Partial TP ---
+    if s.get("partial_tp") is not None and partial_qty >= MIN_QTY:
+        ptp = round_price_for_tp(s["partial_tp"], s["side"], PRICE_TICK)
+        print(f"Partial TP: {close_side} TAKE_PROFIT_MARKET @ {ptp} qty={partial_qty}")
+        place_order(
+            symbol=symbol,
+            side=close_side,
+            type="TAKE_PROFIT_MARKET",
+            stopPrice=fmt(ptp, 1),
+            quantity=fmt(partial_qty, 6),
+            positionSide=pos_side_str,
+            workingType="CONTRACT_PRICE",
+            timeInForce="GTE_GTC",
+            reduceOnly="true" if not HEDGE_MODE else None,
+        )
+
+    # --- Final TP ---
+    if s.get("final_tp") is not None and remain_qty >= MIN_QTY:
+        ftp = round_price_for_tp(s["final_tp"], s["side"], PRICE_TICK)
+        print(f"Final TP:   {close_side} TAKE_PROFIT_MARKET @ {ftp} qty={remain_qty}")
+        place_order(
+            symbol=symbol,
+            side=close_side,
+            type="TAKE_PROFIT_MARKET",
+            stopPrice=fmt(ftp, 1),
+            quantity=fmt(remain_qty, 6),
+            positionSide=pos_side_str,
+            workingType="CONTRACT_PRICE",
+            timeInForce="GTE_GTC",
+            reduceOnly="true" if not HEDGE_MODE else None,
+        )
+
+    st["in_trade"] = True
+    st["last_sl"]  = s.get("sl_price")
+    st["last_tp"]  = s.get("final_tp")
 
     save_state(st)
 

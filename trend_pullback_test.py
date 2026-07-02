@@ -209,7 +209,59 @@ def run_backtest(df,
 
     return pd.DataFrame(trades)
 
-# ── 4. ŠTATISTIKA ─────────────────────────────────────────────────────────────
+# ── 4. SHORT BACKTEST ────────────────────────────────────────────────────────
+
+def run_backtest_short(df, trail_atr=3.0):
+    trades = []
+    in_trade = False
+
+    for i in range(2, len(df)):
+        row  = df.iloc[i]
+        prev = df.iloc[i-1]
+
+        if not in_trade:
+            trend_down    = row["close"] < row["ma200"]
+            ma200_falling = row["ma200_slope"] < 0
+            adx_ok        = row["adx14"] > 25
+            dist          = row["dist_ma20"]
+            pullback_ok   = (dist > 1.0) and (dist < 8.0)  # 1-8% NAD MA20
+            volatility_ok = row["atr_pct"] < 5.0
+            breakout_down = row["close"] < prev["low"]  # prelomenie dole
+
+            if trend_down and ma200_falling and adx_ok and pullback_ok and volatility_ok and breakout_down:
+                in_trade    = True
+                entry_price = row["close"]
+                entry_time  = row["open_time"]
+                entry_i     = i
+                trail_stop  = entry_price + trail_atr * row["atr"]  # stop NAD vstupom
+                max_adverse = 0.0
+
+        else:
+            adverse = (entry_price - row["close"]) / entry_price * 100
+            if adverse < max_adverse:
+                max_adverse = adverse
+
+            duration = i - entry_i
+
+            # Trail stop ide len NADOL (chránime zisk na shorte)
+            new_stop = row["close"] + trail_atr * row["atr"]
+            if new_stop < trail_stop:
+                trail_stop = new_stop
+
+            if row["close"] > trail_stop:
+                pnl = (entry_price - row["close"]) / entry_price * 100
+                trades.append({
+                    "entry": entry_time, "exit": row["open_time"],
+                    "entry_price": entry_price, "exit_price": row["close"],
+                    "pnl": pnl, "type": "trail_stop",
+                    "duration": duration, "max_adverse": max_adverse,
+                })
+                in_trade = False
+
+    return pd.DataFrame(trades) if trades else pd.DataFrame(columns=["entry","exit","entry_price","exit_price","pnl","type","duration","max_adverse"])
+
+
+# ── 5. ŠTATISTIKA ─────────────────────────────────────────────────────────────
 
 def print_stats(trades, label=""):
     print(f"── {label} ──")
@@ -327,7 +379,25 @@ if __name__ == "__main__":
         print_stats(trades, f"{symbol} | trail=3xATR, bez MA50 exit, ADX>25")
         all_trades.append(trades)
 
-    # Kombinované štatistiky — všetky coiny spolu
+    # Kombinované LONG štatistiky
     combined = pd.concat(all_trades, ignore_index=True)
-    print_stats(combined, "COMBINED — BTC + ETH + SOL + BNB")
-    print(f"Celkový počet obchodov pre B1 label: {len(combined)}")
+    print_stats(combined, "COMBINED LONG — BTC + ETH + SOL + BNB")
+
+    # ── SHORTY ──────────────────────────────────────────────────────────────────
+    print("\n" + "="*60)
+    print("  SHORTY — cena pod MA200, pullback 1-8% nad MA20, breakout dole")
+    print("="*60)
+
+    all_shorts = []
+    for symbol in SYMBOLS:
+        df = fetch_data(symbol=symbol, interval="4h", limit=10950)
+        df = add_indicators(df)
+        df = df.dropna().reset_index(drop=True)
+
+        shorts = run_backtest_short(df, trail_atr=3.0)
+        shorts["symbol"] = symbol
+        print_stats(shorts, f"{symbol} SHORT | trail=3xATR, ADX>25")
+        all_shorts.append(shorts)
+
+    combined_shorts = pd.concat(all_shorts, ignore_index=True)
+    print_stats(combined_shorts, "COMBINED SHORT — BTC + ETH + SOL + BNB")

@@ -105,6 +105,18 @@ def perf(eq: pd.Series):
     dd = (eq/eq.cummax()-1).min()*100
     return float(total), float(dd)
 
+def send_telegram(text):
+    token   = os.getenv("TELEGRAM_TOKEN", "")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+    if not token or not chat_id:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        requests.post(url, data={"chat_id": chat_id, "text": text}, timeout=10)
+    except Exception as e:
+        print(f"[WARN] Telegram: {e}")
+
+
 def compute_pullback_signal(df):
     """
     Skontroluje pullback podmienky na poslednej sviečke.
@@ -357,10 +369,29 @@ def main():
 
     if side == 1:
         print(f"SIGNAL: LONG | proba={proba_live:.3f} | close={fmt(close)} | ATR={fmt(atr_last)} | SL={fmt(sl_price)} | PartialTP={fmt(partial_tp)} | {tp_info} | qty={fmt(qty_suggest,6)}")
+        send_telegram(
+            f"🟢 PULLBACK LONG — {SYMBOL}\n"
+            f"Close: {fmt(close)}\n"
+            f"SL: {fmt(sl_price)}\n"
+            f"ATR: {fmt(atr_last)}\n"
+            f"Qty: {fmt(qty_suggest, 6)}"
+        )
     elif side == -1:
         print(f"SIGNAL: SHORT | proba={proba_live:.3f} | close={fmt(close)} | ATR={fmt(atr_last)} | SL={fmt(sl_price)} | PartialTP={fmt(partial_tp)} | {tp_info} | qty={fmt(qty_suggest,6)}")
+        send_telegram(
+            f"🔴 PULLBACK SHORT — {SYMBOL}\n"
+            f"Close: {fmt(close)}\n"
+            f"SL: {fmt(sl_price)}\n"
+            f"ATR: {fmt(atr_last)}\n"
+            f"Qty: {fmt(qty_suggest, 6)}"
+        )
     else:
         print(f"SIGNAL: FLAT | proba={proba_live:.3f} | close={fmt(close)}")
+        send_telegram(
+            f"⚪ FLAT — {SYMBOL}\n"
+            f"Close: {fmt(close)}\n"
+            f"Žiadny signal."
+        )
 
     out_row = {
         "utc_time": now_utc.strftime("%Y-%m-%d %H:%M"),

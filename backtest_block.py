@@ -164,8 +164,11 @@ def main():
     print(merged.tail(15)[cols].to_string(index=False))
 
     # 7) Save
-    os.makedirs("logs", exist_ok=True)
-    out_path = os.path.join("logs", f"block_ab_{SYMBOL}_{INTERVAL}.csv")
+    _data_dir = os.getenv("DATA_DIR")
+    if not _data_dir or not os.path.exists(_data_dir):
+        raise RuntimeError(f"DATA_DIR chýba alebo SSD nie je pripojené: {_data_dir}")
+    os.makedirs(os.path.join(_data_dir, "logs"), exist_ok=True)
+    out_path = os.path.join(_data_dir, "logs", f"block_ab_{SYMBOL}_{INTERVAL}.csv")
     merged.to_csv(out_path, index=False)
     print(f"\nSaved: {out_path}")
 

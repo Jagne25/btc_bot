@@ -27,6 +27,8 @@ raw_data/
 .env
 .env.*
 !.env.example
+env
+env.*
 
 # Runtime state
 portfolio_state.json

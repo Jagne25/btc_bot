@@ -20,8 +20,13 @@ from sqlalchemy import create_engine, text
 # =========================
 # CONFIG
 # =========================
-BASE_DIR = Path(r"C:\btc_bot")
-LOGS_DIR = BASE_DIR / "logs"
+load_dotenv(dotenv_path=os.getenv("ENV_FILE", ".env"))
+_BASE_SSD = Path(os.getenv("BASE_SSD_DIR", "/Volumes/WORK_SSD/TradingData/btc_bot"))
+_COIN_MAP = {"BTCUSDT": "BTC", "ETHUSDT": "ETH", "BNBUSDT": "BNB", "SOLUSDT": "SOL"}
+
+def _logs_dir(symbol: str) -> Path:
+    coin = _COIN_MAP.get(symbol, symbol.replace("USDT", ""))
+    return _BASE_SSD / coin / "logs"
 
 INTERVAL = "4h"
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"]
@@ -64,7 +69,7 @@ def load_observe_csv(symbol: str, model: str) -> Optional[pd.DataFrame]:
     Expected observe columns (minimum):
       close_time, open, high, low, close, proba_up, social_count_total, pos
     """
-    csv_path = LOGS_DIR / f"observe_{symbol}_{INTERVAL}_{model}.csv"
+    csv_path = _logs_dir(symbol) / f"observe_{symbol}_{INTERVAL}_{model}.csv"
     if not csv_path.exists():
         return None
 
@@ -325,8 +330,8 @@ def process_symbol_model(engine, symbol: str, model: str) -> None:
     print(summary.to_string(index=False))
 
     # Save
-    detail_path = LOGS_DIR / f"social_context_detail_{symbol}_{INTERVAL}_{model}.csv"
-    summary_path = LOGS_DIR / f"social_context_summary_{symbol}_{INTERVAL}_{model}.csv"
+    detail_path = _logs_dir(symbol) / f"social_context_detail_{symbol}_{INTERVAL}_{model}.csv"
+    summary_path = _logs_dir(symbol) / f"social_context_summary_{symbol}_{INTERVAL}_{model}.csv"
     df_metrics.to_csv(detail_path, index=False)
     summary.to_csv(summary_path, index=False)
 

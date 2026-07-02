@@ -171,9 +171,13 @@ def attach_social_to_segment(seg_df: pd.DataFrame, symbol: str) -> pd.DataFrame:
 
 # -------------------- data --------------------
 
-def get_klines(symbol="BTCUSDT", interval="1d", lookback=1000):
+def get_klines(symbol="BTCUSDT", interval="1d", lookback=1000, start_end_time=None):
+    """
+    start_end_time: ak je zadaný (unix ms), stiahne lookback sviečok končiacich na tomto čase.
+    Používa sa v walk-forward na testovanie rôznych historických okien.
+    """
     url = "https://api.binance.com/api/v3/klines"
-    out, end_time = [], None
+    out, end_time = [], start_end_time  # začni od zadaného end_time alebo od teraz
     while len(out) < lookback:
         params = {"symbol": symbol, "interval": interval, "limit": 1000}
         if end_time is not None:
@@ -546,8 +550,9 @@ def main():
     print(f"Ensemble: {ENSEMBLE_MODE}")
     print(f"Label: SIMPLE SIGN (CLEAN) - label=exekúcia alignment (TIME_STOP={TSTOP})\n")
 
-    # data
-    df = get_klines(SYMBOL, INTERVAL, lookback=LOOKBACK)
+    # data — ak WF_END_IDX je zadaný, stiahni sviečky končiace pred daným časom (walk-forward)
+    wf_end_ms = _get_int("WF_END_MS", 0) or None  # unix ms — end čas okna pre walk-forward
+    df = get_klines(SYMBOL, INTERVAL, lookback=LOOKBACK, start_end_time=wf_end_ms)
     
     # === DUPLICITY CHECK (DRUHÁ AI) ===
     dup_count = df.duplicated("open_time").sum()
@@ -800,8 +805,11 @@ def main():
                 use_cols = [c for c in observe_cols + ["pos"] if c in observe_df.columns]
                 observe_df = observe_df[use_cols]
 
-                os.makedirs("logs", exist_ok=True)
-                observe_path = os.path.join("logs", f"observe_{SYMBOL}_{INTERVAL}_{name}.csv")
+                _data_dir = os.getenv("DATA_DIR")
+                if not _data_dir or not os.path.exists(_data_dir):
+                    raise RuntimeError(f"DATA_DIR chýba alebo SSD nie je pripojené: {_data_dir}")
+                os.makedirs(os.path.join(_data_dir, "logs"), exist_ok=True)
+                observe_path = os.path.join(_data_dir, "logs", f"observe_{SYMBOL}_{INTERVAL}_{name}.csv")
                 observe_df.to_csv(observe_path, index=False)
                 print(f"  [OBSERVE] Social log ulozeny do: {observe_path}")
             except Exception as e:

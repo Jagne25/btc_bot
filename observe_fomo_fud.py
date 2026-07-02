@@ -13,8 +13,16 @@ import pandas as pd
 
 # ----- KONFIGURÁCIA -----
 
-BASE_DIR = Path(r"C:\btc_bot")
-LOGS_DIR = BASE_DIR / "logs"
+import os
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=os.getenv("ENV_FILE", ".env"))
+
+_BASE_SSD = Path(os.getenv("BASE_SSD_DIR", "/Volumes/WORK_SSD/TradingData/btc_bot"))
+_COIN_MAP = {"BTCUSDT": "BTC", "ETHUSDT": "ETH", "BNBUSDT": "BNB", "SOLUSDT": "SOL"}
+
+def _logs_dir(symbol: str) -> Path:
+    coin = _COIN_MAP.get(symbol, symbol.replace("USDT", ""))
+    return _BASE_SSD / coin / "logs"
 
 INTERVAL = "4h"         # zhoduje sa s observe CSV
 BAR_HOURS = 4           # jedna sviečka = 4 hodiny
@@ -27,7 +35,7 @@ HORIZONS_HOURS = [4, 8, 12, 24]    # kam pozeráme dopredu
 
 def load_observe_df(symbol: str) -> pd.DataFrame | None:
     """Načíta observe CSV pre daný symbol, vráti DataFrame alebo None."""
-    csv_path = LOGS_DIR / f"observe_{symbol}_{INTERVAL}_LR.csv"
+    csv_path = _logs_dir(symbol) / f"observe_{symbol}_{INTERVAL}_LR.csv"
     if not csv_path.exists():
         print(f"\n[{symbol}] CSV neexistuje, preskakujem: {csv_path}")
         return None

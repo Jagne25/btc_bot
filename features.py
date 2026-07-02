@@ -63,6 +63,7 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     d["vol_rel_20"] = d["volume"] / d["vol_ma_20"].replace(0, np.nan)
     d["vol_zscore_20"] = (d["volume"] - d["vol_ma_20"]) / d["volume"].rolling(20).std().replace(0, np.nan)
 
+
     # 7) Vzdialenosti k hranam range (prakticke do SQL)
     d["dist_hh_50"] = (hh_prev - close_prev) / close_prev
     d["dist_ll_50"] = (close_prev - ll_prev) / close_prev
@@ -72,5 +73,30 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     body = (d["close"] - d["open"]).abs()
     d["bar_body_pct"] = body / bar_range.replace(0, np.nan)
     d["bar_range_vs_atr"] = bar_range / d["atr14"].replace(0, np.nan)
+
+    # 9) MACD
+    ema12 = d["close"].ewm(span=12, adjust=False).mean()
+    ema26 = d["close"].ewm(span=26, adjust=False).mean()
+    macd_line = ema12 - ema26
+    macd_signal = macd_line.ewm(span=9, adjust=False).mean()
+    d["macd"] = macd_line.shift(1)
+    d["macd_signal"] = macd_signal.shift(1)
+    d["macd_hist"] = (macd_line - macd_signal).shift(1)
+
+    # 10) ADX(14) — sila trendu (nie smer)
+    # +DM = o koľko je dnešné high vyššie ako včerajšie
+    # -DM = o koľko je dnešné low nižšie ako včerajšie
+    high_diff = d["high"].diff()
+    low_diff  = -d["low"].diff()
+    plus_dm   = high_diff.where((high_diff > low_diff) & (high_diff > 0), 0.0)
+    minus_dm  = low_diff.where((low_diff > high_diff) & (low_diff > 0), 0.0)
+    atr14_adx = tr.ewm(span=14, adjust=False).mean()
+    plus_di   = 100 * plus_dm.ewm(span=14, adjust=False).mean() / atr14_adx.replace(0, np.nan)
+    minus_di  = 100 * minus_dm.ewm(span=14, adjust=False).mean() / atr14_adx.replace(0, np.nan)
+    dx        = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx       = dx.ewm(span=14, adjust=False).mean()
+    d["adx14"]    = adx.shift(1)      # sila trendu: >25 = trend, <20 = choppy
+    d["plus_di"]  = plus_di.shift(1)  # bullish sila
+    d["minus_di"] = minus_di.shift(1) # bearish sila
 
     return d

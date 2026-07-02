@@ -163,9 +163,12 @@ def guess_symbol_from_title(title: str) -> str | None:
 
 def fetch_rss() -> Iterable[Dict[str, Any]]:
     """Prejde definované RSS feedy a vytvorí záznamy pre social_mentions."""
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; btc-scraper/1.0)"}
     for source_name, feed_url in RSS_FEEDS:
         try:
-            feed = feedparser.parse(feed_url)
+            resp = requests.get(feed_url, headers=headers, timeout=15)
+            resp.raise_for_status()
+            feed = feedparser.parse(resp.content)
         except Exception as e:
             logging.error("RSS %s parse failed: %s", source_name, e)
             continue

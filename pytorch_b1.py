@@ -20,10 +20,12 @@ FEATURE_COLS = [
     "rsi14", "zscore20", "atr_pct",
     "trend_slope", "above_slow",
     "pos_in_range_50", "vol_rel_20",
-    "macd_hist", "adx14", "plus_di", "minus_di"
+    "macd_hist", "adx14", "plus_di", "minus_di",
+    "direction"  # 1=long, 0=short
 ]
 
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
+SYMBOLS_LONG  = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
+SYMBOLS_SHORT = ["BTCUSDT", "ETHUSDT", "BNBUSDT"]  # SOL vynechané — MaxDD -93%
 
 # ── 1. DÁTA ──────────────────────────────────────────────────────────────────
 
@@ -121,44 +123,87 @@ def run_backtest(df, trail_atr=3.0):
 
     return pd.DataFrame(trades) if trades else pd.DataFrame(columns=["entry","pnl"])
 
-# ── 4. BUILD DATASET ─────────────────────────────────────────────────────────
-# Pre každý coin: spusti backtest → zisti entry dátumy → vytiahni features
+def run_backtest_short(df, trail_atr=3.0):
+    trades = []
+    in_trade = False
 
-def build_dataset(symbols):
+    for i in range(2, len(df)):
+        row  = df.iloc[i]
+        prev = df.iloc[i-1]
+
+        if not in_trade:
+            trend_down    = row["close"] < row["ma200"]
+            ma200_falling = row["ma200_slope"] < 0
+            adx_ok        = row["adx14_bt"] > 25
+            dist          = row["dist_ma20"]
+            pullback_ok   = (dist > 1.0) and (dist < 8.0)
+            volatility_ok = row["atr_pct_bt"] < 5.0
+            breakout_down = row["close"] < prev["low"]
+
+            if trend_down and ma200_falling and adx_ok and pullback_ok and volatility_ok and breakout_down:
+                in_trade    = True
+                entry_price = row["close"]
+                entry_time  = row["open_time"]
+                trail_stop  = entry_price + trail_atr * row["atr"]
+        else:
+            new_stop = row["close"] + trail_atr * row["atr"]
+            if new_stop < trail_stop:
+                trail_stop = new_stop
+
+            if row["close"] > trail_stop:
+                pnl = (entry_price - row["close"]) / entry_price * 100
+                trades.append({"entry": entry_time, "pnl": pnl})
+                in_trade = False
+
+    return pd.DataFrame(trades) if trades else pd.DataFrame(columns=["entry","pnl"])
+
+# ── 4. BUILD DATASET ─────────────────────────────────────────────────────────
+
+def _extract_rows(trades, df_feat, symbol, direction):
+    rows = []
+    for _, trade in trades.iterrows():
+        if trade["entry"] not in df_feat.index:
+            continue
+        feat_row = df_feat.loc[trade["entry"]]
+        if any(pd.isna(feat_row[col]) for col in FEATURE_COLS[:-1]):  # bez direction
+            continue
+        rows.append({
+            "entry":     trade["entry"],
+            "symbol":    symbol,
+            "direction": direction,
+            "label":     1 if trade["pnl"] > 0 else 0,
+            **{col: float(feat_row[col]) for col in FEATURE_COLS[:-1]}
+        })
+    return rows
+
+def build_dataset():
     all_rows = []
 
-    for symbol in symbols:
-        print(f"  {symbol}...")
-        df_raw = fetch_data(symbol)
-
-        # Dva df: jeden pre features, jeden pre backtest podmienky
-        df_feat = build_features(df_raw.copy())
-        df_feat = df_feat.set_index("open_time")
-
-        df_bt = add_bt_indicators(df_raw.copy())
-        df_bt = df_bt.dropna().reset_index(drop=True)
-
-        trades = run_backtest(df_bt)
+    for symbol in SYMBOLS_LONG:
+        print(f"  LONG {symbol}...")
+        df_raw  = fetch_data(symbol)
+        df_feat = build_features(df_raw.copy()).set_index("open_time")
+        df_bt   = add_bt_indicators(df_raw.copy()).dropna().reset_index(drop=True)
+        trades  = run_backtest(df_bt)
         if len(trades) == 0:
             print(f"    Žiadne obchody.")
             continue
+        rows = _extract_rows(trades, df_feat, symbol, direction=1)
+        print(f"    {len(trades)} obchodov → {len(rows)} s features")
+        all_rows.extend(rows)
 
-        matched = 0
-        for _, trade in trades.iterrows():
-            if trade["entry"] not in df_feat.index:
-                continue
-            feat_row = df_feat.loc[trade["entry"]]
-            if any(pd.isna(feat_row[col]) for col in FEATURE_COLS):
-                continue
-            all_rows.append({
-                "entry":  trade["entry"],
-                "symbol": symbol,
-                "label":  1 if trade["pnl"] > 0 else 0,
-                **{col: float(feat_row[col]) for col in FEATURE_COLS}
-            })
-            matched += 1
-
-        print(f"    {len(trades)} obchodov → {matched} s features")
+    for symbol in SYMBOLS_SHORT:
+        print(f"  SHORT {symbol}...")
+        df_raw  = fetch_data(symbol)
+        df_feat = build_features(df_raw.copy()).set_index("open_time")
+        df_bt   = add_bt_indicators(df_raw.copy()).dropna().reset_index(drop=True)
+        trades  = run_backtest_short(df_bt)
+        if len(trades) == 0:
+            print(f"    Žiadne obchody.")
+            continue
+        rows = _extract_rows(trades, df_feat, symbol, direction=0)
+        print(f"    {len(trades)} obchodov → {len(rows)} s features")
+        all_rows.extend(rows)
 
     return pd.DataFrame(all_rows)
 
@@ -211,8 +256,8 @@ def train_model(X_train, y_train, input_size, epochs=300):
 # ── 7. MAIN ───────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("Buduje dataset (4 coiny × pullback backtest × features)...")
-    dataset = build_dataset(SYMBOLS)
+    print("Buduje dataset (long 4 coiny + short 3 coiny × features)...")
+    dataset = build_dataset()
     dataset = dataset.sort_values("entry").reset_index(drop=True)
 
     n_total = len(dataset)
